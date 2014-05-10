@@ -118,7 +118,7 @@ gs_plugin_startup (GsPlugin *plugin, GCancellable *cancellable, GError **error)
 		AsComponent *cpt;
 		cpt = (AsComponent*) g_ptr_array_index (items, i);
 		g_hash_table_insert (plugin->priv->cpts,
-							g_strdup (as_component_get_idname (cpt)),
+							g_strdup (as_component_get_id (cpt)),
 							g_object_ref (cpt));
 	}
 
@@ -127,6 +127,60 @@ gs_plugin_startup (GsPlugin *plugin, GCancellable *cancellable, GError **error)
 out:
 	gs_profile_stop (plugin->profile, "appstream::startup");
 	return ret;
+}
+
+/**
+ * gs_plugin_refine_add_screenshots:
+ */
+static void
+gs_plugin_refine_add_screenshots (GsApp *app, AsComponent *item)
+{
+	AsImage *im;
+	AsScreenshot *ss;
+	AsScreenshotKind ss_kind;
+	GPtrArray *images_as;
+	GPtrArray *screenshots_as;
+	GsScreenshot *screenshot;
+	guint i;
+	guint j;
+
+	/* do we have any to add */
+	screenshots_as = as_component_get_screenshots (item);
+	if (screenshots_as->len == 0)
+		return;
+
+	/* does the app already have some */
+	gs_app_add_kudo (app, GS_APP_KUDO_HAS_SCREENSHOTS);
+	if (gs_app_get_screenshots(app)->len > 0)
+		return;
+
+	/* add any we know */
+	for (i = 0; i < screenshots_as->len &&
+		    i < GS_PLUGIN_APPSTREAM_MAX_SCREENSHOTS; i++) {
+		ss = g_ptr_array_index (screenshots_as, i);
+		images_as = as_screenshot_get_images (ss);
+		if (images_as->len == 0)
+			continue;
+		ss_kind = as_screenshot_get_kind (ss);
+		if (ss_kind == AS_SCREENSHOT_KIND_UNKNOWN)
+			continue;
+
+		/* create a new application screenshot and add each image */
+		screenshot = gs_screenshot_new ();
+		gs_screenshot_set_is_default (screenshot,
+					      ss_kind == AS_SCREENSHOT_KIND_DEFAULT);
+		gs_screenshot_set_caption (screenshot,
+					   as_screenshot_get_caption (ss));
+		for (j = 0; j < images_as->len; j++) {
+			im = g_ptr_array_index (images_as, j);
+			gs_screenshot_add_image	(screenshot,
+						 as_image_get_url (im),
+						 as_image_get_width (im),
+						 as_image_get_height (im));
+		}
+		gs_app_add_screenshot (app, screenshot);
+		g_object_unref (screenshot);
+	}
 }
 
 /**
@@ -139,8 +193,8 @@ gs_plugin_refine_item (GsPlugin *plugin,
 		       GError **error)
 {
 	GHashTable *urls;
-	const gchar *pkgname;
 	const gchar *tmp;
+	GPtrArray *pkgs;
 	GdkPixbuf *pixbuf;
 	gboolean ret = TRUE;
 
@@ -150,8 +204,12 @@ gs_plugin_refine_item (GsPlugin *plugin,
 			gs_app_set_kind (app, GS_APP_KIND_NORMAL);
 	}
 
+	/* FIXME: This looks like a hack... Need to learn how to properly set app states */
+	if (gs_app_get_state (app) == GS_APP_STATE_UNKNOWN)
+		gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
+
 	/* set id */
-	gs_app_set_id (app, as_component_get_idname (item));
+	gs_app_set_id (app, as_component_get_id (item));
 
 	/* set name */
 	tmp = as_component_get_name (item);
@@ -238,10 +296,21 @@ gs_plugin_refine_item (GsPlugin *plugin,
 			gs_app_set_project_group (app, tmp);
 	}
 
-	/* set package names */
-	pkgname = as_component_get_pkgname (item);
+	/* this is a core application for the desktop and cannot be removed */
+	if (as_component_is_compulsory_for_desktop (item, "GNOME") &&
+	    gs_app_get_kind (app) == GS_APP_KIND_NORMAL)
+		gs_app_set_kind (app, GS_APP_KIND_SYSTEM);
 
-	// TODO
+	/* set package names */
+	pkgs = gs_app_get_sources (app);
+	if (pkgs->len == 0) {
+		g_ptr_array_add (pkgs, g_strdup (as_component_get_pkgname (item)));
+	}
+
+	/* set screenshots */
+	gs_plugin_refine_add_screenshots (app, item);
+
+	/* TODO: Refine more stuff */
 
 out:
 	return ret;
@@ -368,10 +437,8 @@ gs_plugin_add_search (GsPlugin *plugin,
 	for (i = 0; i < array->len; i++) {
 		AsComponent *cpt;
 		cpt = (AsComponent*) g_ptr_array_index (array, i);
-		app = gs_app_new (as_component_get_idname (cpt));
+		app = gs_app_new (as_component_get_id (cpt));
 		ret = gs_plugin_refine_item (plugin, app, cpt, error);
-		/* FIXME: This looks like a hack... Need to learn how to properly set app states */
-		gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
 		if (!ret)
 			goto out;
 		gs_plugin_add_app (list, app);
@@ -382,6 +449,146 @@ gs_plugin_add_search (GsPlugin *plugin,
 out:
 	if (term != NULL)
 		g_free (term);
+	if (array != NULL)
+		g_ptr_array_unref (array);
+	return ret;
+}
+
+/**
+ * gs_plugin_add_categories:
+ */
+gboolean
+gs_plugin_add_categories (GsPlugin *plugin,
+			  GList **list,
+			  GCancellable *cancellable,
+			  GError **error)
+{
+	const gchar *search_id1;
+	const gchar *search_id2 = NULL;
+	gboolean ret = TRUE;
+	GList *l;
+	GList *l2;
+	GList *children;
+	GList *cpt_list;
+	GList *cl;
+	GsCategory *category;
+	GsCategory *parent;
+
+	/* load database */
+	if (g_once_init_enter (&plugin->priv->done_init)) {
+		ret = gs_plugin_startup (plugin, cancellable, error);
+		g_once_init_leave (&plugin->priv->done_init, TRUE);
+		if (!ret)
+			goto out;
+	}
+
+	/* find out how many packages are in each category */
+	gs_profile_start (plugin->profile, "appstream::add-categories");
+	cpt_list = g_hash_table_get_values (plugin->priv->cpts);
+
+	for (l = *list; l != NULL; l = l->next) {
+		parent = GS_CATEGORY (l->data);
+		search_id2 = gs_category_get_id (parent);
+		children = gs_category_get_subcategories (parent);
+
+		for (l2 = children; l2 != NULL; l2 = l2->next) {
+			category = GS_CATEGORY (l2->data);
+
+			/* just look at each app in turn */
+			for (cl = cpt_list; cl != NULL; cl = cl->next) {
+				AsComponent *item;
+				item = AS_COMPONENT (cl->data);
+
+				if (as_component_get_id (item) == NULL)
+					continue;
+				if (!as_component_has_category (item, search_id2))
+					continue;
+				search_id1 = gs_category_get_id (category);
+				if (search_id1 != NULL &&
+				    !as_component_has_category (item, search_id1))
+					continue;
+
+				/* we have another result */
+				gs_category_increment_size (category);
+				gs_category_increment_size (parent);
+			}
+		}
+		g_list_free (children);
+	}
+	gs_profile_stop (plugin->profile, "appstream::add-categories");
+out:
+	return ret;
+}
+
+/**
+ * gs_plugin_add_category_apps:
+ */
+gboolean
+gs_plugin_add_category_apps (GsPlugin *plugin,
+			     GsCategory *category,
+			     GList **list,
+			     GCancellable *cancellable,
+			     GError **error)
+{
+	const gchar *search_id1;
+	const gchar *search_id2 = NULL;
+	gboolean ret = TRUE;
+	GsCategory *parent;
+	GPtrArray *array = NULL;
+	guint i;
+
+	/* load database */
+	if (g_once_init_enter (&plugin->priv->done_init)) {
+		ret = gs_plugin_startup (plugin, cancellable, error);
+		g_once_init_leave (&plugin->priv->done_init, TRUE);
+		if (!ret)
+			goto out;
+	}
+
+	/* get the two search terms */
+	gs_profile_start (plugin->profile, "appstream::add-category-apps");
+	search_id1 = gs_category_get_id (category);
+	parent = gs_category_get_parent (category);
+	if (parent != NULL)
+		search_id2 = gs_category_get_id (parent);
+
+	/* the "General" item has no ID */
+	if (search_id1 == NULL) {
+		search_id1 = search_id2;
+		search_id2 = NULL;
+	}
+
+	/* quick-find the applications */
+	array = as_database_find_components_by_str (plugin->priv->db, "", search_id1);
+	if ((array == NULL) || (array->len == 0)) {
+		g_set_error (error,
+			     GS_PLUGIN_LOADER_ERROR,
+			     GS_PLUGIN_LOADER_ERROR_NO_RESULTS,
+			     _("No components in category '%s' found."),
+				 search_id1);
+		ret = FALSE;
+		goto out;
+	}
+
+	/* just look at each app in turn */
+	for (i = 0; i < array->len; i++) {
+		GsApp *app;
+		AsComponent *item;
+		item = g_ptr_array_index (array, i);
+		if (as_component_get_id (item) == NULL)
+			continue;
+		if (search_id2 != NULL && !as_component_has_category (item, search_id2))
+			continue;
+
+		/* got a search match, so add all the data we can */
+		app = gs_app_new (as_component_get_id (item));
+		ret = gs_plugin_refine_item (plugin, app, item, error);
+		if (!ret)
+			goto out;
+		gs_plugin_add_app (list, app);
+	}
+	gs_profile_stop (plugin->profile, "appstream::add-category-apps");
+out:
 	if (array != NULL)
 		g_ptr_array_unref (array);
 	return ret;
