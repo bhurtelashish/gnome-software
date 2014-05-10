@@ -32,6 +32,7 @@
 struct GsPluginPrivate {
 	AsDatabase		*db;
 	GHashTable		*cpts; /* utf8->AsComponent */
+	gsize done_init;
 };
 
 /**
@@ -40,7 +41,7 @@ struct GsPluginPrivate {
 const gchar *
 gs_plugin_get_name (void)
 {
-	return "libappstream";
+	return "appstream";
 }
 
 /**
@@ -55,6 +56,7 @@ gs_plugin_initialize (GsPlugin *plugin)
 						g_str_equal,
 						g_free,
 						g_object_unref);
+	plugin->priv->done_init = FALSE;
 }
 
 /**
@@ -89,8 +91,9 @@ gs_plugin_startup (GsPlugin *plugin, GCancellable *cancellable, GError **error)
 	guint i;
 	gboolean ret;
 
-	/* open the cache */
 	gs_profile_start (plugin->profile, "appstream::startup");
+
+	/* open the cache */
 	ret = as_database_open (plugin->priv->db);
 	if (!ret) {
 		g_set_error (error,
@@ -138,6 +141,7 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	GHashTable *urls;
 	const gchar *pkgname;
 	const gchar *tmp;
+	GdkPixbuf *pixbuf;
 	gboolean ret = TRUE;
 
 	/* is an app */
@@ -203,10 +207,36 @@ gs_plugin_refine_item (GsPlugin *plugin,
 					tmp);
 	}
 
+	/* set icon, if possible */
+	tmp = as_component_get_icon_url (item);
+	pixbuf = gdk_pixbuf_new_from_file (tmp, NULL);
+	if (pixbuf == NULL) {
+		tmp = as_component_get_icon (item);
+		pixbuf = gtk_icon_theme_load_icon (gtk_icon_theme_get_default (),
+					   tmp,
+					   64,
+					   GTK_ICON_LOOKUP_USE_BUILTIN |
+					   GTK_ICON_LOOKUP_FORCE_SIZE,
+					   NULL);
+		if (pixbuf == NULL) {
+			pixbuf = gtk_icon_theme_load_icon (gtk_icon_theme_get_default (),
+					   "stock-unknown",
+					   64,
+					   GTK_ICON_LOOKUP_USE_BUILTIN |
+					   GTK_ICON_LOOKUP_FORCE_SIZE,
+					   NULL);
+		}
+	}
+	if (pixbuf != NULL)
+		gs_app_set_pixbuf (app, pixbuf);
+
 	/* set project group */
-	if (as_component_get_project_group (item) != NULL &&
-	    gs_app_get_project_group (app) == NULL)
-		gs_app_set_project_group (app, as_component_get_project_group (item));
+	tmp = as_component_get_project_group (item);
+	if ((tmp != NULL) &&
+		(g_strcmp0 (tmp, "") != 0) &&
+	    (gs_app_get_project_group (app) == NULL)) {
+			gs_app_set_project_group (app, tmp);
+	}
 
 	/* set package names */
 	pkgname = as_component_get_pkgname (item);
@@ -245,7 +275,6 @@ gs_plugin_refine_from_id (GsPlugin *plugin,
 		goto out;
 out:
 	*found = (item != NULL);
-	g_object_unref (item);
 	return ret;
 }
 
@@ -264,9 +293,12 @@ gs_plugin_refine (GsPlugin *plugin,
 	GList *l;
 	GsApp *app;
 
-	ret = gs_plugin_startup (plugin, cancellable, error);
-	if (!ret)
-		goto out;
+	if (g_once_init_enter (&plugin->priv->done_init)) {
+		ret = gs_plugin_startup (plugin, cancellable, error);
+		g_once_init_leave (&plugin->priv->done_init, TRUE);
+		if (!ret)
+			goto out;
+	}
 
 	gs_profile_start (plugin->profile, "appstream::refine");
 	for (l = *list; l != NULL; l = l->next) {
@@ -294,70 +326,6 @@ out:
 	return ret;
 }
 
-#if 0
-/**
- * gs_plugin_add_category_apps:
- */
-gboolean
-gs_plugin_add_category_apps (GsPlugin *plugin,
-			     GsCategory *category,
-			     GList **list,
-			     GCancellable *cancellable,
-			     GError **error)
-{
-	const gchar *search_id1;
-	const gchar *search_id2 = NULL;
-	gboolean ret = TRUE;
-	GsApp *app;
-	AsApp *item;
-	GsCategory *parent;
-	GPtrArray *array;
-	guint i;
-
-	/* load XML files */
-	if (g_once_init_enter (&plugin->priv->done_init)) {
-		ret = gs_plugin_startup (plugin, cancellable, error);
-		g_once_init_leave (&plugin->priv->done_init, TRUE);
-		if (!ret)
-			goto out;
-	}
-
-	/* get the two search terms */
-	gs_profile_start (plugin->profile, "appstream::add-category-apps");
-	search_id1 = gs_category_get_id (category);
-	parent = gs_category_get_parent (category);
-	if (parent != NULL)
-		search_id2 = gs_category_get_id (parent);
-
-	/* the "General" item has no ID */
-	if (search_id1 == NULL) {
-		search_id1 = search_id2;
-		search_id2 = NULL;
-	}
-
-	/* just look at each app in turn */
-	array = as_store_get_apps (plugin->priv->store);
-	for (i = 0; i < array->len; i++) {
-		item = g_ptr_array_index (array, i);
-		if (as_app_get_id (item) == NULL)
-			continue;
-		if (!as_app_has_category (item, search_id1))
-			continue;
-		if (search_id2 != NULL && !as_app_has_category (item, search_id2))
-			continue;
-
-		/* got a search match, so add all the data we can */
-		app = gs_app_new (as_app_get_id_full (item));
-		ret = gs_plugin_refine_item (plugin, app, item, error);
-		if (!ret)
-			goto out;
-		gs_plugin_add_app (list, app);
-	}
-	gs_profile_stop (plugin->profile, "appstream::add-category-apps");
-out:
-	return ret;
-}
-
 /**
  * gs_plugin_add_search:
  */
@@ -368,13 +336,13 @@ gs_plugin_add_search (GsPlugin *plugin,
 		      GCancellable *cancellable,
 		      GError **error)
 {
-	AsApp *item;
 	gboolean ret = TRUE;
-	GPtrArray *array;
+	gchar *term = NULL;
+	GPtrArray *array = NULL;
 	GsApp *app;
 	guint i;
 
-	/* load XML files */
+	/* load database */
 	if (g_once_init_enter (&plugin->priv->done_init)) {
 		ret = gs_plugin_startup (plugin, cancellable, error);
 		g_once_init_leave (&plugin->priv->done_init, TRUE);
@@ -384,84 +352,37 @@ gs_plugin_add_search (GsPlugin *plugin,
 
 	/* search categories for the search term */
 	gs_profile_start (plugin->profile, "appstream::search");
-	array = as_store_get_apps (plugin->priv->store);
-	for (i = 0; i < array->len; i++) {
-		item = g_ptr_array_index (array, i);
-		if (as_app_search_matches_all (item, values) != 0) {
-			app = gs_app_new (as_app_get_id_full (item));
-			ret = gs_plugin_refine_item (plugin, app, item, error);
-			if (!ret)
-				goto out;
-			gs_plugin_add_app (list, app);
-		}
+	term = g_strjoinv (",", values);
+	array = as_database_find_components_by_str (plugin->priv->db, term, NULL);
+
+	if ((array == NULL) || (array->len == 0)) {
+		g_set_error (error,
+			     GS_PLUGIN_LOADER_ERROR,
+			     GS_PLUGIN_LOADER_ERROR_NO_RESULTS,
+			     _("No component matching '%s' found."),
+				 term);
+		ret = FALSE;
+		goto out;
 	}
-	gs_profile_stop (plugin->profile, "appstream::search");
-out:
-	return ret;
-}
 
-/**
- * gs_plugin_add_categories:
- */
-gboolean
-gs_plugin_add_categories (GsPlugin *plugin,
-			  GList **list,
-			  GCancellable *cancellable,
-			  GError **error)
-{
-	AsApp *item;
-	const gchar *search_id1;
-	const gchar *search_id2 = NULL;
-	gboolean ret = TRUE;
-	GList *l;
-	GList *l2;
-	GList *children;
-	GPtrArray *array;
-	GsCategory *category;
-	GsCategory *parent;
-	guint i;
-
-	/* load XML files */
-	if (g_once_init_enter (&plugin->priv->done_init)) {
-		ret = gs_plugin_startup (plugin, cancellable, error);
-		g_once_init_leave (&plugin->priv->done_init, TRUE);
+	for (i = 0; i < array->len; i++) {
+		AsComponent *cpt;
+		cpt = (AsComponent*) g_ptr_array_index (array, i);
+		app = gs_app_new (as_component_get_idname (cpt));
+		ret = gs_plugin_refine_item (plugin, app, cpt, error);
+		/* FIXME: This looks like a hack... Need to learn how to properly set app states */
+		gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
 		if (!ret)
 			goto out;
+		gs_plugin_add_app (list, app);
 	}
 
-	/* find ogs_plugin_as_store_changed_cbut how many packages are in each category */
-	gs_profile_start (plugin->profile, "appstream::add-categories");
-	array = as_store_get_apps (plugin->priv->store);
-	for (l = *list; l != NULL; l = l->next) {
-		parent = GS_CATEGORY (l->data);
-		search_id2 = gs_category_get_id (parent);
-		children = gs_category_get_subcategories (parent);
-		for (l2 = children; l2 != NULL; l2 = l2->next) {
-			category = GS_CATEGORY (l2->data);
+	gs_profile_stop (plugin->profile, "appstream::search");
 
-			/* just look at each app in turn */
-			for (i = 0; i < array->len; i++) {
-				item = g_ptr_array_index (array, i);
-				if (as_app_get_id (item) == NULL)
-					continue;
-				if (as_app_get_priority (item) < 0)
-					continue;
-				if (!as_app_has_category (item, search_id2))
-					continue;
-				search_id1 = gs_category_get_id (category);
-				if (search_id1 != NULL &&
-				    !as_app_has_category (item, search_id1))
-					continue;
-
-				/* we have another result */
-				gs_category_increment_size (category);
-				gs_category_increment_size (parent);
-			}
-		}
-		g_list_free (children);
-	}
-	gs_profile_stop (plugin->profile, "appstream::add-categories");
 out:
+	if (term != NULL)
+		g_free (term);
+	if (array != NULL)
+		g_ptr_array_unref (array);
 	return ret;
 }
-#endif
