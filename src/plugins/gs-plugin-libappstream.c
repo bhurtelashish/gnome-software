@@ -1,5 +1,6 @@
 /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
  *
+ * Copyright (C) 2013-2014 Richard Hughes <richard@hughsie.com>
  * Copyright (C) 2014 Matthias Klumpp <matthias@tenstral.net>
  *
  * Licensed under the GNU General Public License Version 2
@@ -23,6 +24,8 @@
 #include <glib/gi18n.h>
 #include <locale.h>
 #include <appstream.h>
+
+#include "as-dummy.h"
 
 #include <gs-plugin.h>
 #include <gs-plugin-loader.h>
@@ -135,14 +138,11 @@ out:
 static void
 gs_plugin_refine_add_screenshots (GsApp *app, AsComponent *item)
 {
-	AsImage *im;
 	AsScreenshot *ss;
 	AsScreenshotKind ss_kind;
 	GPtrArray *images_as;
 	GPtrArray *screenshots_as;
-	GsScreenshot *screenshot;
 	guint i;
-	guint j;
 
 	/* do we have any to add */
 	screenshots_as = as_component_get_screenshots (item);
@@ -165,21 +165,7 @@ gs_plugin_refine_add_screenshots (GsApp *app, AsComponent *item)
 		if (ss_kind == AS_SCREENSHOT_KIND_UNKNOWN)
 			continue;
 
-		/* create a new application screenshot and add each image */
-		screenshot = gs_screenshot_new ();
-		gs_screenshot_set_is_default (screenshot,
-					      ss_kind == AS_SCREENSHOT_KIND_DEFAULT);
-		gs_screenshot_set_caption (screenshot,
-					   as_screenshot_get_caption (ss));
-		for (j = 0; j < images_as->len; j++) {
-			im = g_ptr_array_index (images_as, j);
-			gs_screenshot_add_image	(screenshot,
-						 as_image_get_url (im),
-						 as_image_get_width (im),
-						 as_image_get_height (im));
-		}
-		gs_app_add_screenshot (app, screenshot);
-		g_object_unref (screenshot);
+		gs_app_add_screenshot (app, ss);
 	}
 }
 
@@ -205,8 +191,8 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	}
 
 	/* FIXME: This looks like a hack... Need to learn how to properly set app states */
-	if (gs_app_get_state (app) == GS_APP_STATE_UNKNOWN)
-		gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
+	if (gs_app_get_state (app) == AS_APP_STATE_UNKNOWN)
+		gs_app_set_state (app, AS_APP_STATE_AVAILABLE);
 
 	/* set id */
 	gs_app_set_id (app, as_component_get_id (item));
@@ -230,13 +216,13 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	/* add urls */
 	urls = as_component_get_urls (item);
 	if (g_hash_table_size (urls) > 0 &&
-	    gs_app_get_url (app, GS_APP_URL_KIND_HOMEPAGE) == NULL) {
+	    gs_app_get_url (app, AS_URL_KIND_HOMEPAGE) == NULL) {
 		GList *keys;
 		GList *l;
 		keys = g_hash_table_get_keys (urls);
 		for (l = keys; l != NULL; l = l->next) {
 			gs_app_set_url (app,
-					l->data,
+					as_url_kind_from_string (l->data),
 					g_hash_table_lookup (urls, l->data));
 		}
 		g_list_free (keys);
@@ -304,7 +290,11 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	/* set package names */
 	pkgs = gs_app_get_sources (app);
 	if (pkgs->len == 0) {
-		g_ptr_array_add (pkgs, g_strdup (as_component_get_pkgname (item)));
+		guint i;
+		gchar **pkg_names = as_component_get_pkgnames (item);
+		for (i = 0; pkg_names[i] != NULL; i++) {
+			g_ptr_array_add (pkgs, g_strdup (pkg_names[i]));
+		}
 	}
 
 	/* set screenshots */
@@ -422,7 +412,7 @@ gs_plugin_add_search (GsPlugin *plugin,
 	/* search categories for the search term */
 	gs_profile_start (plugin->profile, "appstream::search");
 	term = g_strjoinv (",", values);
-	array = as_database_find_components_by_str (plugin->priv->db, term, NULL);
+	array = as_database_find_components_by_term (plugin->priv->db, term, NULL);
 
 	if ((array == NULL) || (array->len == 0)) {
 		g_set_error (error,
@@ -559,7 +549,7 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 	}
 
 	/* quick-find the applications */
-	array = as_database_find_components_by_str (plugin->priv->db, "", search_id1);
+	array = as_database_find_components_by_term (plugin->priv->db, "", search_id1);
 	if ((array == NULL) || (array->len == 0)) {
 		g_set_error (error,
 			     GS_PLUGIN_LOADER_ERROR,

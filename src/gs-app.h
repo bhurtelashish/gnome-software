@@ -24,7 +24,8 @@
 
 #include <glib-object.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
-#include <appstream-glib.h>
+#include <appstream.h>
+#include "plugins/as-dummy.h"
 
 G_BEGIN_DECLS
 
