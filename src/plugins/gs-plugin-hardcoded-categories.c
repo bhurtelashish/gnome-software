@@ -24,6 +24,7 @@
 
 #include <glib/gi18n.h>
 
+#include "gs-cleanup.h"
 #include <gs-plugin.h>
 #include <gs-category.h>
 
@@ -164,7 +165,7 @@ gs_plugin_add_categories (GsPlugin *plugin,
 				}
 			}
 		}
-		if (cat)
+		if (cat != NULL)
 			gs_category_increment_size (cat);
 	}
 
@@ -181,7 +182,6 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 	GsCategory *parent;
 	const gchar *id;
 	guint i;
-	GsApp *app;
 
 	if (g_strcmp0 (gs_category_get_id (category), "featured") != 0)
 		return TRUE;
@@ -191,6 +191,7 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 
 	for (i = 0; i < G_N_ELEMENTS (featured); i++) {
 		if (g_strcmp0 (id, featured[i].category) == 0) {
+			_cleanup_object_unref_ GsApp *app = NULL;
 			app = gs_app_new (featured[i].app);
 			gs_plugin_add_app (list, app);
 		}

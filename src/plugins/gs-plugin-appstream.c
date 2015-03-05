@@ -24,14 +24,11 @@
 #include <locale.h>
 #include <appstream-glib.h>
 
+#include "gs-cleanup.h"
 #include <gs-plugin.h>
 #include <gs-plugin-loader.h>
 
 #define	GS_PLUGIN_APPSTREAM_MAX_SCREENSHOTS	5
-
-#if AS_CHECK_VERSION(0,3,0)
-#define as_app_get_id_full(a)	as_app_get_id(a)
-#endif
 
 struct GsPluginPrivate {
 	AsStore			*store;
@@ -136,12 +133,12 @@ gs_plugin_appstream_get_origins_hash (GPtrArray *array)
 {
 	AsApp *app;
 	GHashTable *origins = NULL;
-	GList *keys = NULL;
 	GList *l;
 	const gchar *tmp;
 	gdouble perc;
 	guint *cnt;
 	guint i;
+	_cleanup_list_free_ GList *keys = NULL;
 
 	/* create a hash table with origin:cnt */
 	origins = g_hash_table_new_full (g_str_hash, g_str_equal,
@@ -169,7 +166,6 @@ gs_plugin_appstream_get_origins_hash (GPtrArray *array)
 		*cnt = perc;
 	}
 
-	g_list_free (keys);
 	return origins;
 }
 
@@ -180,15 +176,13 @@ static gboolean
 gs_plugin_startup (GsPlugin *plugin, GError **error)
 {
 	AsApp *app;
-	GHashTable *origins = NULL;
 	GPtrArray *items;
 	gboolean ret;
 	const gchar *origin;
 	gchar *tmp;
 	guint *perc;
-#if AS_CHECK_VERSION(0,3,1)
 	guint i;
-#endif
+	_cleanup_hashtable_unref_ GHashTable *origins = NULL;
 
 	/* clear all existing applications if the store was invalidated */
 	as_store_remove_all (plugin->priv->store);
@@ -242,7 +236,6 @@ gs_plugin_startup (GsPlugin *plugin, GError **error)
 	}
 
 	/* look for any application with a HiDPI icon kudo */
-#if AS_CHECK_VERSION(0,3,1)
 	for (i = 0; i < items->len; i++) {
 		app = g_ptr_array_index (items, i);
 		if (as_app_has_kudo_kind (app, AS_KUDO_KIND_HI_DPI_ICON)) {
@@ -250,15 +243,10 @@ gs_plugin_startup (GsPlugin *plugin, GError **error)
 			break;
 		}
 	}
-#endif
 out:
-	if (origins != NULL)
-		g_hash_table_unref (origins);
 	gs_profile_stop (plugin->profile, "appstream::startup");
 	return ret;
 }
-
-#if AS_CHECK_VERSION(0,3,1)
 
 /**
  * gs_plugin_refine_item_pixbuf:
@@ -266,24 +254,51 @@ out:
 static void
 gs_plugin_refine_item_pixbuf (GsPlugin *plugin, GsApp *app, AsApp *item)
 {
-	GError *error = NULL;
 	AsIcon *icon;
 	gboolean ret;
+	_cleanup_error_free_ GError *error = NULL;
+	_cleanup_free_ gchar *fn = NULL;
+	_cleanup_free_ gchar *path = NULL;
 
 	icon = as_app_get_icon_default (item);
 	switch (as_icon_get_kind (icon)) {
 	case AS_ICON_KIND_REMOTE:
-		gs_app_set_icon (app, as_icon_get_name (icon));
+		gs_app_set_icon (app, icon);
+		path = g_build_filename (g_get_user_data_dir (),
+					 "gnome-software",
+					 "icons",
+					 NULL);
+		fn = g_build_filename (path, as_icon_get_name (icon), NULL);
+		as_icon_set_filename (icon, fn);
+		as_icon_set_prefix (icon, path);
+		if (g_file_test (fn, G_FILE_TEST_EXISTS)) {
+			as_icon_set_kind (icon, AS_ICON_KIND_LOCAL);
+			ret = gs_app_load_icon (app, plugin->scale, &error);
+			if (!ret) {
+				g_warning ("failed to load icon %s: %s",
+					   as_icon_get_name (icon),
+					   error->message);
+				return;
+			}
+		}
 		break;
 	case AS_ICON_KIND_STOCK:
 	case AS_ICON_KIND_LOCAL:
-		gs_app_set_icon (app, as_icon_get_name (icon));
+		gs_app_set_icon (app, icon);
+
+		/* does not exist, so try to find using the icon theme */
+		if (as_icon_get_kind (icon) == AS_ICON_KIND_LOCAL &&
+		    as_icon_get_filename (icon) == NULL)
+			as_icon_set_kind (icon, AS_ICON_KIND_STOCK);
+
+		/* load */
 		ret = gs_app_load_icon (app, plugin->scale, &error);
 		if (!ret) {
-			g_warning ("failed to load stock icon %s: %s",
-				   as_icon_get_name (icon), error->message);
-			g_error_free (error);
-			return;
+			g_warning ("failed to load %s icon %s: %s",
+				   as_icon_kind_to_string (as_icon_get_kind (icon)),
+				   as_icon_get_name (icon),
+				   error->message);
+				return;
 		}
 		break;
 	case AS_ICON_KIND_CACHED:
@@ -299,117 +314,15 @@ gs_plugin_refine_item_pixbuf (GsPlugin *plugin, GsApp *app, AsApp *item)
 		if (!as_icon_load (icon, AS_ICON_LOAD_FLAG_SEARCH_SIZE, &error)) {
 			g_warning ("failed to load cached icon %s: %s",
 				   as_icon_get_name (icon), error->message);
-			g_error_free (error);
-			return;
+				return;
 		}
 		gs_app_set_pixbuf (app, as_icon_get_pixbuf (icon));
 		break;
 	default:
-		g_warning ("icon kind unknown for %s", as_app_get_id_full (item));
+		g_warning ("icon kind unknown for %s", as_app_get_id (item));
 		break;
 	}
 }
-
-#else
-
-/**
- * _as_app_get_icon_for_scale:
- */
-static GdkPixbuf *
-_as_app_get_icon_for_scale (AsApp *app, gint scale, GError **error)
-{
-	GdkPixbuf *pixbuf = NULL;
-	const gchar *icon;
-	const gchar *icon_path;
-	gchar *filename_hidpi = NULL;
-	gchar *filename_lodpi = NULL;
-	gchar *filename = NULL;
-
-	/* HiDPI */
-	icon = as_app_get_icon (app);
-	if (icon == NULL)
-		goto out;
-	icon_path = as_app_get_icon_path (app);
-	if (icon_path == NULL)
-		goto out;
-	if (scale == 2) {
-		filename_hidpi = g_build_filename (icon_path, "128x128", icon, NULL);
-		if (g_file_test (filename_hidpi, G_FILE_TEST_EXISTS)) {
-			pixbuf = gdk_pixbuf_new_from_file (filename_hidpi, error);
-			if (pixbuf == NULL)
-				goto out;
-			goto out;
-		}
-	}
-
-	/* LoDPI */
-	filename_lodpi = g_build_filename (icon_path, "64x64", icon, NULL);
-	if (g_file_test (filename_lodpi, G_FILE_TEST_EXISTS)) {
-		pixbuf = gdk_pixbuf_new_from_file (filename_lodpi, error);
-		goto out;
-	}
-
-	/* fallback */
-	filename = g_build_filename (icon_path, icon, NULL);
-	pixbuf = gdk_pixbuf_new_from_file_at_scale (filename, 64, 64,
-						    FALSE, error);
-	if (pixbuf == NULL)
-		goto out;
-out:
-	g_free (filename_hidpi);
-	g_free (filename_lodpi);
-	g_free (filename);
-	return pixbuf;
-}
-
-/**
- * gs_plugin_refine_item_pixbuf:
- */
-static void
-gs_plugin_refine_item_pixbuf (GsPlugin *plugin, GsApp *app, AsApp *item)
-{
-	GdkPixbuf *pb = NULL;
-	GError *error = NULL;
-	const gchar *icon;
-	gboolean ret;
-
-	icon = as_app_get_icon (item);
-	switch (as_app_get_icon_kind (item)) {
-	case AS_ICON_KIND_REMOTE:
-		gs_app_set_icon (app, icon);
-		break;
-#if AS_CHECK_VERSION(0,2,7)
-	case AS_ICON_KIND_LOCAL:
-#endif
-	case AS_ICON_KIND_STOCK:
-		gs_app_set_icon (app, icon);
-		ret = gs_app_load_icon (app, plugin->scale, &error);
-		if (!ret) {
-			g_warning ("failed to load stock icon %s: %s",
-				   icon, error->message);
-			g_error_free (error);
-			goto out;
-		}
-		break;
-	case AS_ICON_KIND_CACHED:
-		pb = _as_app_get_icon_for_scale (item, plugin->scale, &error);
-		if (pb == NULL) {
-			g_warning ("failed to load cached icon %s: %s",
-				   as_app_get_icon (item), error->message);
-			g_error_free (error);
-			goto out;
-		}
-		gs_app_set_pixbuf (app, pb);
-		break;
-	default:
-		g_warning ("icon kind unknown for %s", as_app_get_id_full (item));
-		break;
-	}
-out:
-	if (pb != NULL)
-		g_object_unref (pb);
-}
-#endif
 
 /**
  * gs_plugin_refine_add_addons:
@@ -426,23 +339,17 @@ gs_plugin_refine_add_addons (GsPlugin *plugin, GsApp *app, AsApp *item)
 
 	for (i = 0; i < addons->len; i++) {
 		AsApp *as_addon = g_ptr_array_index (addons, i);
-		GsApp *addon;
-		GError *error = NULL;
-		gboolean ret;
+		_cleanup_error_free_ GError *error = NULL;
+		_cleanup_object_unref_ GsApp *addon = NULL;
 
-		addon = gs_app_new (as_app_get_id_full (as_addon));
+		addon = gs_app_new (as_app_get_id (as_addon));
 
 		/* add all the data we can */
-		ret = gs_plugin_refine_item (plugin, addon, as_addon, &error);
-		if (!ret) {
+		if (!gs_plugin_refine_item (plugin, addon, as_addon, &error)) {
 			g_warning ("failed to refine addon: %s", error->message);
-			g_error_free (error);
-			g_object_unref (addon);
 			continue;
 		}
-
 		gs_app_add_addon (app, addon);
-		g_object_unref (addon);
 	}
 }
 /**
@@ -485,9 +392,9 @@ gs_plugin_refine_add_screenshots (GsApp *app, AsApp *item)
 static void
 gs_plugin_appstream_set_license (GsApp *app, const gchar *license_string)
 {
-	GString *urld;
-	gchar **tokens;
 	guint i;
+	_cleanup_string_free_ GString *urld = NULL;
+	_cleanup_strv_free_ gchar **tokens = NULL;
 
 	/* tokenize the license string and URLify any SPDX IDs */
 	urld = g_string_sized_new (strlen (license_string) + 1);
@@ -538,8 +445,6 @@ gs_plugin_appstream_set_license (GsApp *app, const gchar *license_string)
 		g_string_append (urld, tokens[i]);
 	}
 	gs_app_set_licence (app, urld->str);
-	g_strfreev (tokens);
-	g_string_free (urld, TRUE);
 }
 
 /**
@@ -619,8 +524,6 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	GPtrArray *pkgnames;
 	GPtrArray *kudos;
 	const gchar *tmp;
-	gboolean ret = TRUE;
-	gchar *from_xml;
 	guint i;
 
 	/* is an app */
@@ -655,8 +558,8 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	}
 
 	/* set id */
-	if (as_app_get_id_full (item) != NULL && gs_app_get_id (app) == NULL)
-		gs_app_set_id (app, as_app_get_id_full (item));
+	if (as_app_get_id (item) != NULL && gs_app_get_id (app) == NULL)
+		gs_app_set_id (app, as_app_get_id (item));
 
 	/* set name */
 	tmp = as_app_get_name (item, NULL);
@@ -678,15 +581,14 @@ gs_plugin_refine_item (GsPlugin *plugin,
 	urls = as_app_get_urls (item);
 	if (g_hash_table_size (urls) > 0 &&
 	    gs_app_get_url (app, AS_URL_KIND_HOMEPAGE) == NULL) {
-		GList *keys;
 		GList *l;
+		_cleanup_list_free_ GList *keys = NULL;
 		keys = g_hash_table_get_keys (urls);
 		for (l = keys; l != NULL; l = l->next) {
 			gs_app_set_url (app,
 					as_url_kind_from_string (l->data),
 					g_hash_table_lookup (urls, l->data));
 		}
-		g_list_free (keys);
 	}
 
 	/* set licence */
@@ -694,42 +596,30 @@ gs_plugin_refine_item (GsPlugin *plugin,
 		gs_plugin_appstream_set_license (app, as_app_get_project_license (item));
 
 	/* set keywords */
-#if AS_CHECK_VERSION(0,3,0)
 	if (as_app_get_keywords (item, NULL) != NULL &&
 	    gs_app_get_keywords (app) == NULL) {
 		gs_app_set_keywords (app, as_app_get_keywords (item, NULL));
 		gs_app_add_kudo (app, GS_APP_KUDO_HAS_KEYWORDS);
 	}
-#else
-	if (as_app_get_keywords (item) != NULL &&
-	    gs_app_get_keywords (app) == NULL) {
-		gs_app_set_keywords (app, as_app_get_keywords (item));
-		gs_app_add_kudo (app, GS_APP_KUDO_HAS_KEYWORDS);
-	}
-#endif
 
 	/* set description */
 	tmp = as_app_get_description (item, NULL);
 	if (tmp != NULL) {
+		_cleanup_free_ gchar *from_xml = NULL;
 		from_xml = as_markup_convert_simple (tmp, -1, error);
 		if (from_xml == NULL) {
-			ret = FALSE;
-			goto out;
+			g_prefix_error (error, "trying to parse '%s': ", tmp);
+			return FALSE;
 		}
+		gs_app_add_kudo (app, GS_APP_KUDO_APPDATA_DESCRIPTION);
 		gs_app_set_description (app,
 					GS_APP_QUALITY_HIGHEST,
 					from_xml);
-		g_free (from_xml);
 	}
 
 	/* set icon */
-#if AS_CHECK_VERSION(0,3,1)
 	if (as_app_get_icon_default (item) != NULL && gs_app_get_pixbuf (app) == NULL)
 		gs_plugin_refine_item_pixbuf (plugin, app, item);
-#else
-	if (as_app_get_icon (item) != NULL && gs_app_get_pixbuf (app) == NULL)
-		gs_plugin_refine_item_pixbuf (plugin, app, item);
-#endif
 
 	/* set categories */
 	if (as_app_get_categories (item) != NULL &&
@@ -809,18 +699,15 @@ gs_plugin_refine_item (GsPlugin *plugin,
 		case AS_KUDO_KIND_NOTIFICATIONS:
 			gs_app_add_kudo (app, GS_APP_KUDO_USES_NOTIFICATIONS);
 			break;
-#if AS_CHECK_VERSION(0,3,0)
 		case AS_KUDO_KIND_HIGH_CONTRAST:
 			gs_app_add_kudo (app, GS_APP_KUDO_HIGH_CONTRAST);
 			break;
-#endif
 		default:
 			g_debug ("no idea how to handle kudo '%s'", tmp);
 			break;
 		}
 	}
-out:
-	return ret;
+	return TRUE;
 }
 
 /**
@@ -864,7 +751,6 @@ gs_plugin_refine_from_pkgname (GsPlugin *plugin,
 	AsApp *item = NULL;
 	GPtrArray *sources;
 	const gchar *pkgname;
-	gboolean ret = TRUE;
 	guint i;
 
 	/* find anything that matches the ID */
@@ -879,14 +765,10 @@ gs_plugin_refine_from_pkgname (GsPlugin *plugin,
 
 	/* nothing found */
 	if (item == NULL)
-		goto out;
+		return TRUE;
 
 	/* set new properties */
-	ret = gs_plugin_refine_item (plugin, app, item, error);
-	if (!ret)
-		goto out;
-out:
-	return ret;
+	return gs_plugin_refine_item (plugin, app, item, error);
 }
 
 /**
@@ -945,7 +827,6 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 	const gchar *search_id1;
 	const gchar *search_id2 = NULL;
 	gboolean ret = TRUE;
-	GsApp *app;
 	AsApp *item;
 	GsCategory *parent;
 	GPtrArray *array;
@@ -975,8 +856,9 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 	/* just look at each app in turn */
 	array = as_store_get_apps (plugin->priv->store);
 	for (i = 0; i < array->len; i++) {
+		_cleanup_object_unref_ GsApp *app = NULL;
 		item = g_ptr_array_index (array, i);
-		if (as_app_get_id_full (item) == NULL)
+		if (as_app_get_id (item) == NULL)
 			continue;
 		if (!as_app_has_category (item, search_id1))
 			continue;
@@ -984,12 +866,11 @@ gs_plugin_add_category_apps (GsPlugin *plugin,
 			continue;
 
 		/* got a search match, so add all the data we can */
-		app = gs_app_new (as_app_get_id_full (item));
+		app = gs_app_new (as_app_get_id (item));
 		ret = gs_plugin_refine_item (plugin, app, item, error);
 		if (!ret)
 			goto out;
 		gs_plugin_add_app (list, app);
-		g_object_unref (app);
 	}
 out:
 	gs_profile_stop (plugin->profile, "appstream::add-category-apps");
@@ -1006,15 +887,12 @@ gs_plugin_add_search_item_add (GsPlugin *plugin,
 			       guint match_value,
 			       GError **error)
 {
-	GsApp *app;
-	app = gs_app_new (as_app_get_id_full (item));
-	if (!gs_plugin_refine_item (plugin, app, item, error)) {
-		g_object_unref (app);
+	_cleanup_object_unref_ GsApp *app = NULL;
+	app = gs_app_new (as_app_get_id (item));
+	if (!gs_plugin_refine_item (plugin, app, item, error))
 		return FALSE;
-	}
 	gs_app_set_search_sort_key (app, match_value);
 	gs_plugin_add_app (list, app);
-	g_object_unref (app);
 	return TRUE;
 }
 
@@ -1125,7 +1003,6 @@ gs_plugin_add_installed (GsPlugin *plugin,
 	AsApp *item;
 	gboolean ret = TRUE;
 	GPtrArray *array;
-	GsApp *app;
 	guint i;
 
 	/* load XML files */
@@ -1142,12 +1019,12 @@ gs_plugin_add_installed (GsPlugin *plugin,
 	for (i = 0; i < array->len; i++) {
 		item = g_ptr_array_index (array, i);
 		if (as_app_get_source_kind (item) == AS_APP_SOURCE_KIND_APPDATA) {
-			app = gs_app_new (as_app_get_id_full (item));
+			_cleanup_object_unref_ GsApp *app = NULL;
+			app = gs_app_new (as_app_get_id (item));
 			ret = gs_plugin_refine_item (plugin, app, item, error);
 			if (!ret)
 				goto out;
 			gs_plugin_add_app (list, app);
-			g_object_unref (app);
 		}
 	}
 out:
@@ -1161,7 +1038,6 @@ out:
 static void
 gs_plugin_add_categories_for_app (GList *list, AsApp *app)
 {
-	GList *children;
 	GList *l;
 	GList *l2;
 	GsCategory *category;
@@ -1170,6 +1046,7 @@ gs_plugin_add_categories_for_app (GList *list, AsApp *app)
 
 	/* does it match the main category */
 	for (l = list; l != NULL; l = l->next) {
+		_cleanup_list_free_ GList *children = NULL;
 		parent = GS_CATEGORY (l->data);
 		if (!as_app_has_category (app, gs_category_get_id (parent)))
 			continue;
@@ -1185,7 +1062,6 @@ gs_plugin_add_categories_for_app (GList *list, AsApp *app)
 			gs_category_increment_size (category);
 			found_subcat = TRUE;
 		}
-		g_list_free (children);
 
 		/* matching the main category but no subcategories means we have
 		 * to create a new 'Other' subcategory manually */
@@ -1228,7 +1104,7 @@ gs_plugin_add_categories (GsPlugin *plugin,
 	array = as_store_get_apps (plugin->priv->store);
 	for (i = 0; i < array->len; i++) {
 		app = g_ptr_array_index (array, i);
-		if (as_app_get_id_full (app) == NULL)
+		if (as_app_get_id (app) == NULL)
 			continue;
 		if (as_app_get_priority (app) < 0)
 			continue;
@@ -1264,14 +1140,14 @@ gs_plugin_add_popular_from_category (GsPlugin *plugin,
 				     GError **error)
 {
 	AsApp *item;
+	GError *error_local = NULL;
 	GPtrArray *array;
-	GsApp *app;
-	gboolean ret = TRUE;
 	guint i;
 
 	/* search categories for the search term */
 	array = as_store_get_apps (plugin->priv->store);
 	for (i = 0; i < array->len; i++) {
+		_cleanup_object_unref_ GsApp *app = NULL;
 		item = g_ptr_array_index (array, i);
 
 		/* find not-installed desktop application with long descriptions
@@ -1282,37 +1158,37 @@ gs_plugin_add_popular_from_category (GsPlugin *plugin,
 			continue;
 		if (as_app_get_description (item, NULL) == NULL)
 			continue;
-		if (g_hash_table_lookup (ignore_apps, as_app_get_id_full (item)) != NULL)
+		if (g_hash_table_lookup (ignore_apps, as_app_get_id (item)) != NULL)
 			continue;
 		if (!as_app_has_category (item, category))
 			continue;
 		if (category_exclude != NULL && as_app_has_category (item, category_exclude))
 			continue;
-#if AS_CHECK_VERSION(0,3,1)
 		if (plugin->priv->has_hi_dpi_support &&
 		    !as_app_has_kudo_kind (item, AS_KUDO_KIND_HI_DPI_ICON))
 			continue;
-#endif
 
 		/* add application */
-		app = gs_app_new (as_app_get_id_full (item));
-		ret = gs_plugin_refine_item (plugin, app, item, error);
-		if (!ret)
-			goto out;
+		app = gs_app_new (as_app_get_id (item));
+		if (!gs_plugin_refine_item (plugin, app, item, &error_local)) {
+			g_warning ("Failed to refine %s: %s",
+				   as_app_get_id (item),
+				   error_local->message);
+			g_clear_error (&error_local);
+			continue;
+		}
 
 		/* only suggest awesome applications */
 		if (gs_plugin_appstream_is_app_awesome (app)) {
 			g_debug ("suggesting %s as others installed from category %s",
-				 as_app_get_id_full (item), category);
+				 as_app_get_id (item), category);
 			gs_plugin_add_app (list, app);
 			g_hash_table_insert (ignore_apps,
-					     (gpointer) as_app_get_id_full (item),
+					     (gpointer) as_app_get_id (item),
 					     GINT_TO_POINTER (1));
 		}
-		g_object_unref (app);
 	}
-out:
-	return ret;
+	return TRUE;
 }
 
 /**
@@ -1327,13 +1203,13 @@ gs_plugin_add_popular_by_cat (GsPlugin *plugin,
 			      GError **error)
 {
 	AsApp *item;
-	GHashTable *ignore_cats = NULL;
 	GPtrArray *array;
 	GPtrArray *categories;
 	const gchar *tmp;
 	gboolean ret = TRUE;
 	guint i;
 	guint j;
+	_cleanup_hashtable_unref_ GHashTable *ignore_cats = NULL;
 
 	/* ignore main categories */
 	gs_profile_start (plugin->profile, "appstream::add_popular[cat]");
@@ -1390,8 +1266,6 @@ gs_plugin_add_popular_by_cat (GsPlugin *plugin,
 	}
 out:
 	gs_profile_stop (plugin->profile, "appstream::add_popular[cat]");
-	if (ignore_cats != NULL)
-		g_hash_table_unref (ignore_cats);
 	return ret;
 }
 
@@ -1405,11 +1279,10 @@ gs_plugin_add_popular_by_source (GsPlugin *plugin,
 				 GError **error)
 {
 	AsApp *item;
-	GHashTable *installed = NULL;	/* source_pkgname : AsApp */
 	GPtrArray *array;
-	GsApp *app;
 	gboolean ret = TRUE;
 	guint i;
+	_cleanup_hashtable_unref_ GHashTable *installed = NULL;	/* srcpkg : AsApp */
 
 	/* get already installed applications */
 	gs_profile_start (plugin->profile, "appstream::add_popular[source]");
@@ -1430,6 +1303,7 @@ gs_plugin_add_popular_by_source (GsPlugin *plugin,
 
 	/* search categories for the search term */
 	for (i = 0; i < array->len; i++) {
+		_cleanup_object_unref_ GsApp *app = NULL;
 		item = g_ptr_array_index (array, i);
 
 		/* find not installed desktop applications */
@@ -1445,7 +1319,7 @@ gs_plugin_add_popular_by_source (GsPlugin *plugin,
 			continue;
 
 		/* add application */
-		app = gs_app_new (as_app_get_id_full (item));
+		app = gs_app_new (as_app_get_id (item));
 		ret = gs_plugin_refine_item (plugin, app, item, error);
 		if (!ret)
 			goto out;
@@ -1453,19 +1327,16 @@ gs_plugin_add_popular_by_source (GsPlugin *plugin,
 		/* only suggest awesome apps */
 		if (gs_plugin_appstream_is_app_awesome (app)) {
 			g_debug ("suggesting %s as others installed from source %s",
-				 as_app_get_id_full (item),
+				 as_app_get_id (item),
 				 as_app_get_source_pkgname (item));
 			gs_plugin_add_app (list, app);
 		} else {
 			g_debug ("not suggesting %s as not awesome enough",
-				 as_app_get_id_full (item));
+				 as_app_get_id (item));
 		}
-		g_object_unref (app);
 	}
 out:
 	gs_profile_stop (plugin->profile, "appstream::add_popular[source]");
-	if (installed != NULL)
-		g_hash_table_unref (installed);
 	return ret;
 }
 
@@ -1481,10 +1352,10 @@ gs_plugin_add_popular (GsPlugin *plugin,
 			GError **error)
 {
 	AsApp *item;
-	GHashTable *ignore_apps = NULL;
 	GPtrArray *array;
 	gboolean ret = TRUE;
 	guint i;
+	_cleanup_hashtable_unref_ GHashTable *ignore_apps = NULL;
 
 	/* load XML files */
 	if (g_once_init_enter (&plugin->priv->done_init)) {
@@ -1503,7 +1374,7 @@ gs_plugin_add_popular (GsPlugin *plugin,
 		if (as_app_get_state (item) != AS_APP_STATE_INSTALLED)
 			continue;
 		g_hash_table_insert (ignore_apps,
-				     (gpointer) as_app_get_id_full (item),
+				     (gpointer) as_app_get_id (item),
 				     GINT_TO_POINTER (1));
 	}
 
@@ -1535,7 +1406,5 @@ gs_plugin_add_popular (GsPlugin *plugin,
 
 out:
 	gs_profile_stop (plugin->profile, "appstream::add_popular");
-	if (ignore_apps != NULL)
-		g_hash_table_unref (ignore_apps);
 	return ret;
 }

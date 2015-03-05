@@ -22,12 +22,12 @@ MAINTAINERCLEANFILES =					\
 	config.sub					\
 	configure					\
 	depcomp						\
-	INSTALL						\
 	install-sh					\
 	ltmain.sh					\
 	Makefile.in					\
 	missing						\
 	mkinstalldirs					\
+	NEWS						\
 	test-driver
 
 EXTRA_DIST =						\
@@ -35,7 +35,6 @@ EXTRA_DIST =						\
 	autogen.sh					\
 	config.h					\
 	COPYING						\
-	INSTALL						\
 	MAINTAINERS					\
 	NEWS						\
 	README
@@ -46,6 +45,7 @@ DISTCHECK_CONFIGURE_FLAGS = 				\
 distclean-local:
 	if test $(srdcir) = .; then :; else \
 		rm -f ChangeLog; \
+		rm -f NEWS; \
 	fi
 
 ChangeLog:
@@ -62,6 +62,14 @@ ChangeLog:
 	  echo A git checkout and git-log is required to generate this file >> $@); \
 	fi
 
-.PHONY: ChangeLog
+NEWS: data/appdata/*.appdata.xml
+	$(AM_V_GEN) \
+	if test -e $(APPSTREAM_UTIL); then \
+		$(APPSTREAM_UTIL) appdata-to-news $^ > $@; \
+	else \
+		touch $@; \
+	fi
+
+.PHONY: ChangeLog NEWS
 
 -include $(top_srcdir)/git.mk

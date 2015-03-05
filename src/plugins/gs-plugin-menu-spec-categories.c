@@ -24,6 +24,7 @@
 #include <gs-plugin.h>
 #include <glib/gi18n.h>
 
+#include "gs-cleanup.h"
 #include "menu-spec-common.h"
 
 /**
@@ -45,7 +46,6 @@ gs_plugin_add_categories (GsPlugin *plugin,
 			  GError **error)
 {
 	GsCategory *category = NULL;
-	GsCategory *sub;
 	const MenuSpecData *msdata;
 	gchar *tmp;
 	gchar msgctxt[100];
@@ -61,11 +61,11 @@ gs_plugin_add_categories (GsPlugin *plugin,
 			*list = g_list_prepend (*list, category);
 			g_snprintf(msgctxt, 100, "Menu subcategory of %s", msdata[i].text);
 		} else {
+			_cleanup_object_unref_ GsCategory *sub = NULL;
 			sub = gs_category_new (category,
 					       tmp + 2,
 					       g_dpgettext2(GETTEXT_PACKAGE, msgctxt, msdata[i].text));
 			gs_category_add_subcategory (category, sub);
-			g_object_unref (sub);
 		}
 	}
 

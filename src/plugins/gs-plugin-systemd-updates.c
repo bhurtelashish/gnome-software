@@ -25,6 +25,7 @@
 #define I_KNOW_THE_PACKAGEKIT_GLIB2_API_IS_SUBJECT_TO_CHANGE
 #include <packagekit-glib2/packagekit.h>
 
+#include "gs-cleanup.h"
 #include <gs-plugin.h>
 
 struct GsPluginPrivate {
@@ -97,19 +98,17 @@ gs_plugin_add_updates (GsPlugin *plugin,
 		       GCancellable *cancellable,
 		       GError **error)
 {
-	GError *error_local = NULL;
-	GsApp *app;
-	gboolean ret = TRUE;
-	gchar **package_ids = NULL;
-	gchar **split;
+	gboolean ret;
 	guint i;
+	_cleanup_error_free_ GError *error_local = NULL;
+	_cleanup_strv_free_ gchar **package_ids = NULL;
 
 	/* watch the file in case it comes or goes */
 	if (g_once_init_enter (&plugin->priv->done_init)) {
 		ret = gs_plugin_startup (plugin, cancellable, error);
 		g_once_init_leave (&plugin->priv->done_init, TRUE);
 		if (!ret)
-			goto out;
+			return FALSE;
 	}
 
 	/* get the id's if the file exists */
@@ -118,17 +117,20 @@ gs_plugin_add_updates (GsPlugin *plugin,
 		if (g_error_matches (error_local,
 				     PK_OFFLINE_ERROR,
 				     PK_OFFLINE_ERROR_NO_DATA)) {
-			g_error_free (error_local);
-			ret = TRUE;
-		} else {
-			g_propagate_error (error, error_local);
-			ret = FALSE;
+			return TRUE;
 		}
-		goto out;
+		g_set_error (error,
+			     GS_PLUGIN_ERROR,
+			     GS_PLUGIN_ERROR_FAILED,
+			     "Failed to get prepared IDs: %s",
+			     error_local->message);
+		return FALSE;
 	}
 
 	/* add them to the new array */
 	for (i = 0; package_ids[i] != NULL; i++) {
+		_cleanup_object_unref_ GsApp *app = NULL;
+		_cleanup_strv_free_ gchar **split = NULL;
 		app = gs_app_new (NULL);
 		gs_app_set_management_plugin (app, "PackageKit");
 		gs_app_add_source_id (app, package_ids[i]);
@@ -138,10 +140,6 @@ gs_plugin_add_updates (GsPlugin *plugin,
 		gs_app_set_state (app, AS_APP_STATE_UPDATABLE);
 		gs_app_set_kind (app, GS_APP_KIND_PACKAGE);
 		gs_plugin_add_app (list, app);
-		g_object_unref (app);
-		g_strfreev (split);
 	}
-out:
-	g_strfreev (package_ids);
-	return ret;
+	return TRUE;
 }

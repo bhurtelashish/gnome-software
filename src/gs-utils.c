@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
  *
- * Copyright (C) 2013 Richard Hughes <richard@hughsie.com>
+ * Copyright (C) 2013-2015 Richard Hughes <richard@hughsie.com>
  *
  * Licensed under the GNU General Public License Version 2
  *
@@ -26,6 +26,7 @@
 #include <errno.h>
 
 #include "gs-app.h"
+#include "gs-cleanup.h"
 #include "gs-utils.h"
 #include "gs-plugin.h"
 
@@ -127,8 +128,8 @@ gs_grab_focus_when_mapped (GtkWidget *widget)
 void
 gs_app_notify_installed (GsApp *app)
 {
-	gchar *summary;
-	GNotification *n;
+	_cleanup_free_ gchar *summary = NULL;
+	_cleanup_object_unref_ GNotification *n = NULL;
 
 	/* TRANSLATORS: this is the summary of a notification that an application
 	 * has been successfully installed */
@@ -143,8 +144,6 @@ gs_app_notify_installed (GsApp *app)
 	g_notification_set_default_action_and_target  (n, "app.details", "(ss)",
 						       gs_app_get_id (app), "");
 	g_application_send_notification (g_application_get_default (), "installed", n);
-	g_object_unref (n);
-	g_free (summary);
 }
 
 /**
@@ -157,8 +156,8 @@ gs_app_notify_failed_modal (GsApp *app,
 			    const GError *error)
 {
 	GtkWidget *dialog;
-	gchar *title;
-	gchar *msg;
+	const gchar *title;
+	_cleanup_free_ gchar *msg = NULL;
 
 	title = _("Sorry, this did not work");
 	switch (action) {
@@ -187,6 +186,156 @@ gs_app_notify_failed_modal (GsApp *app,
 	g_signal_connect (dialog, "response",
 			  G_CALLBACK (gtk_widget_destroy), NULL);
 	gtk_window_present (GTK_WINDOW (dialog));
+}
+
+typedef enum {
+	GS_APP_LICENCE_FREE		= 0,
+	GS_APP_LICENCE_NONFREE		= 1,
+	GS_APP_LICENCE_PATENT_CONCERN	= 2
+} GsAppLicenceHint;
+
+/**
+ * gs_app_notify_unavailable:
+ **/
+GtkResponseType
+gs_app_notify_unavailable (GsApp *app, GtkWindow *parent)
+{
+	GsAppLicenceHint hint = GS_APP_LICENCE_FREE;
+	GtkResponseType response;
+	GtkWidget *dialog;
+	const gchar *licence;
+	gboolean already_enabled = FALSE;	/* FIXME */
+	guint i;
+	struct {
+		const gchar	*str;
+		GsAppLicenceHint hint;
+	} keywords[] = {
+		{ "NonFree",		GS_APP_LICENCE_NONFREE },
+		{ "PatentConcern",	GS_APP_LICENCE_PATENT_CONCERN },
+		{ "Proprietary",	GS_APP_LICENCE_NONFREE },
+		{ NULL, 0 }
+	};
+	_cleanup_free_ gchar *origin_url = NULL;
+	_cleanup_object_unref_ GSettings *settings = NULL;
+	_cleanup_string_free_ GString *body = NULL;
+	_cleanup_string_free_ GString *title = NULL;
+
+	/* this is very crude */
+	licence = gs_app_get_licence (app);
+	if (licence != NULL) {
+		for (i = 0; keywords[i].str != NULL; i++) {
+			if (g_strstr_len (licence, -1, keywords[i].str) != NULL)
+				hint |= keywords[i].hint;
+		}
+	} else {
+		/* use the worst-case assumption */
+		hint = GS_APP_LICENCE_NONFREE | GS_APP_LICENCE_PATENT_CONCERN;
+	}
+
+	/* check if the user has already dismissed */
+	settings = g_settings_new ("org.gnome.software");
+	if (!g_settings_get_boolean (settings, "prompt-for-nonfree"))
+		return GTK_RESPONSE_OK;
+
+	title = g_string_new ("");
+	if (already_enabled) {
+		g_string_append_printf (title, "<b>%s</b>",
+					/* TRANSLATORS: window title */
+					_("Install Third-Party Software?"));
+	} else {
+		g_string_append_printf (title, "<b>%s</b>",
+					/* TRANSLATORS: window title */
+					_("Enable Third-Party Software Source?"));
+	}
+	dialog = gtk_message_dialog_new (parent,
+					 GTK_DIALOG_MODAL,
+					 GTK_MESSAGE_QUESTION,
+					 GTK_BUTTONS_CANCEL,
+					 NULL);
+	gtk_message_dialog_set_markup (GTK_MESSAGE_DIALOG (dialog), title->str);
+
+	/* FIXME: get the URL somehow... */
+	origin_url = g_strdup_printf ("<a href=\"\">%s>/a>", gs_app_get_origin (app));
+	body = g_string_new ("");
+	if (hint & GS_APP_LICENCE_NONFREE) {
+		g_string_append_printf (body,
+					/* TRANSLATORS: the replacements are as follows:
+					 * 1. Application name, e.g. "Firefox"
+					 * 2. Software source name, e.g. fedora-optional
+					 */
+					_("%s is not <a href=\"https://en.wikipedia.org/wiki/Free_and_open-source_software\">"
+					  "free and open source software</a>, "
+					  "and is provided by “%s”."),
+					gs_app_get_name (app),
+					origin_url);
+	} else {
+		g_string_append_printf (body,
+					/* TRANSLATORS: the replacements are as follows:
+					 * 1. Application name, e.g. "Firefox"
+					 * 2. Software source name, e.g. fedora-optional */
+					_("%s is provided by “%s”."),
+					gs_app_get_name (app),
+					origin_url);
+	}
+
+	/* tell the use what needs to be done */
+	if (!already_enabled) {
+		g_string_append (body, " ");
+		g_string_append (body,
+				/* TRANSLATORS: a software source is a repo */
+				_("This software source must be "
+				  "enabled to continue installation."));
+	}
+
+	/* be aware of patent clauses */
+	if (hint & GS_APP_LICENCE_PATENT_CONCERN) {
+		g_string_append (body, "\n\n");
+		if (gs_app_get_id_kind (app) != AS_ID_KIND_CODEC) {
+			g_string_append_printf (body,
+						/* TRANSLATORS: Laws are geographical, urgh... */
+						_("It may be illegal to install "
+						  "or use %s in some countries."),
+						gs_app_get_name (app));
+		} else {
+			g_string_append (body,
+					/* TRANSLATORS: Laws are geographical, urgh... */
+					_("It may be illegal to install or use "
+					  "this codec in some countries."));
+		}
+	}
+
+	gtk_message_dialog_format_secondary_markup (GTK_MESSAGE_DIALOG (dialog), "%s", body->str);
+	/* TRANSLATORS: this is button text to not ask about non-free content again */
+	if (0) gtk_dialog_add_button (GTK_DIALOG (dialog), _("Don't Warn Again"), GTK_RESPONSE_YES);
+	if (already_enabled) {
+		gtk_dialog_add_button (GTK_DIALOG (dialog),
+				       /* TRANSLATORS: button text */
+				       _("Install"),
+				       GTK_RESPONSE_OK);
+	} else {
+		gtk_dialog_add_button (GTK_DIALOG (dialog),
+				       /* TRANSLATORS: button text */
+				       _("Enable and Install"),
+				       GTK_RESPONSE_OK);
+	}
+	response = gtk_dialog_run (GTK_DIALOG (dialog));
+	if (response == GTK_RESPONSE_YES) {
+		response = GTK_RESPONSE_OK;
+		g_settings_set_boolean (settings, "prompt-for-nonfree", FALSE);
+	}
+	gtk_widget_destroy (dialog);
+	return response;
+}
+
+void
+gs_app_show_url (GsApp *app, AsUrlKind kind)
+{
+	const gchar *url;
+	_cleanup_error_free_ GError *error = NULL;
+
+	url = gs_app_get_url (app, kind);
+	if (!gtk_show_uri (NULL, url, GDK_CURRENT_TIME, &error))
+		g_warning ("spawn of '%s' failed", url);
 }
 
 guint
@@ -232,105 +381,34 @@ out:
 gboolean
 gs_mkdir_parent (const gchar *path, GError **error)
 {
-	gboolean ret = TRUE;
-	gchar *parent;
+	_cleanup_free_ gchar *parent = NULL;
 
 	parent = g_path_get_dirname (path);
 	if (g_mkdir_with_parents (parent, 0755) == -1) {
-		ret = FALSE;
 		g_set_error (error,
 			     GS_PLUGIN_ERROR,
 			     GS_PLUGIN_ERROR_FAILED,
 			     "Failed to create '%s': %s",
 			     parent, g_strerror (errno));
+		return FALSE;
 	}
-
-	g_free (parent);
-	return ret;
-}
-
-static GtkIconTheme *icon_theme_singleton;
-static GMutex        icon_theme_lock;
-static GHashTable   *icon_theme_paths;
-
-static GtkIconTheme *
-icon_theme_get (void)
-{
-	if (icon_theme_singleton == NULL)
-		icon_theme_singleton = gtk_icon_theme_new ();
-
-	return icon_theme_singleton;
-}
-
-static void
-icon_theme_add_path (const gchar *path)
-{
-	if (path == NULL)
-		return;
-
-	if (icon_theme_paths == NULL)
-		icon_theme_paths = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
-
-	if (!g_hash_table_contains (icon_theme_paths, path)) {
-		gtk_icon_theme_prepend_search_path (icon_theme_get (), path);
-		g_hash_table_add (icon_theme_paths, g_strdup (path));
-	}
-}
-
-/**
- * gs_pixbuf_load:
- **/
-GdkPixbuf *
-gs_pixbuf_load (const gchar *icon_name,
-		const gchar *icon_path,
-		guint icon_size,
-		GError **error)
-{
-	GdkPixbuf *pixbuf = NULL;
-
-	g_return_val_if_fail (icon_name != NULL, NULL);
-	g_return_val_if_fail (icon_size > 0, NULL);
-
-	if (icon_name[0] == '\0') {
-		g_set_error_literal (error,
-				     GS_PLUGIN_ERROR,
-				     GS_PLUGIN_ERROR_FAILED,
-				     "Icon name not specified");
-	} else if (icon_name[0] == '/') {
-		pixbuf = gdk_pixbuf_new_from_file_at_size (icon_name,
-							   icon_size,
-							   icon_size,
-							   error);
-	} else {
-		g_mutex_lock (&icon_theme_lock);
-		icon_theme_add_path (icon_path);
-		pixbuf = gtk_icon_theme_load_icon (icon_theme_get (),
-						   icon_name,
-						   icon_size,
-						   GTK_ICON_LOOKUP_USE_BUILTIN |
-						   GTK_ICON_LOOKUP_FORCE_SIZE,
-						   error);
-		g_mutex_unlock (&icon_theme_lock);
-	}
-	return pixbuf;
+	return TRUE;
 }
 
 static void
 reboot_done (GObject *source, GAsyncResult *res, gpointer data)
 {
 	GCallback reboot_failed = data;
-	GVariant *ret;
-	GError *error = NULL;
+	_cleanup_variant_unref_ GVariant *ret = NULL;
+	_cleanup_error_free_ GError *error = NULL;
 
 	ret = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), res, &error);
-	if (ret) {
-		g_variant_unref (ret);
+	if (ret)
 		return;
-	}
 
-	if (error) {
-		g_warning ("Calling org.gnome.SessionManager.Reboot failed: %s", error->message);
-		g_error_free (error);
+	if (error != NULL) {
+		g_warning ("Calling org.gnome.SessionManager.Reboot failed: %s",
+			   error->message);
 	}
 
 	reboot_failed ();
@@ -339,7 +417,7 @@ reboot_done (GObject *source, GAsyncResult *res, gpointer data)
 void
 gs_reboot (GCallback reboot_failed)
 {
-	GDBusConnection *bus;
+	_cleanup_object_unref_ GDBusConnection *bus = NULL;
 
 	g_debug ("calling org.gnome.SessionManager.Reboot");
 
@@ -356,7 +434,6 @@ gs_reboot (GCallback reboot_failed)
 				NULL,
 				reboot_done,
 				reboot_failed);
-	g_object_unref (bus);
 }
 
 /**

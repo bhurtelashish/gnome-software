@@ -24,6 +24,7 @@
 
 #include <glib/gi18n.h>
 
+#include "gs-cleanup.h"
 #include <gs-plugin.h>
 #include <gs-category.h>
 
@@ -106,17 +107,16 @@ gs_plugin_add_popular (GsPlugin *plugin,
 		       GCancellable *cancellable,
 		       GError **error)
 {
-	GsApp *app;
 	gboolean ret = TRUE;
-	gchar **apps = NULL;
 	guint i;
+	_cleanup_strv_free_ gchar **apps = NULL;
 
 	/* load XML files */
 	if (g_once_init_enter (&plugin->priv->done_init)) {
 		ret = gs_plugin_startup (plugin, error);
 		g_once_init_leave (&plugin->priv->done_init, TRUE);
 		if (!ret)
-			goto out;
+			return FALSE;
 	}
 
 	if (g_getenv ("GNOME_SOFTWARE_POPULAR")) {
@@ -128,24 +128,21 @@ gs_plugin_add_popular (GsPlugin *plugin,
 						 category);
 	}
 	if (apps == NULL) {
-		ret = FALSE;
 		g_set_error (error,
 			     GS_PLUGIN_ERROR,
 			     GS_PLUGIN_ERROR_FAILED,
 			     "No moduleset data found");
-		goto out;
+		return FALSE;
 	}
 
 	/* just add all */
 	for (i = 0; apps[i]; i++) {
+		_cleanup_object_unref_ GsApp *app = NULL;
 		app = gs_app_new (apps[i]);
 		gs_plugin_add_app (list, app);
 		gs_app_add_kudo (app, GS_APP_KUDO_FEATURED_RECOMMENDED);
-		g_object_unref (app);
 	}
-out:
-	g_strfreev (apps);
-	return ret;
+	return TRUE;
 }
 
 /**
@@ -161,16 +158,16 @@ gs_plugin_refine (GsPlugin *plugin,
 	GList *l;
 	GsApp *app;
 	gboolean ret = TRUE;
-	gchar **apps = NULL;
-	gchar **pkgs = NULL;
 	guint i;
+	_cleanup_strv_free_ gchar **apps = NULL;
+	_cleanup_strv_free_ gchar **pkgs = NULL;
 
 	/* load XML files */
 	if (g_once_init_enter (&plugin->priv->done_init)) {
 		ret = gs_plugin_startup (plugin, error);
 		g_once_init_leave (&plugin->priv->done_init, TRUE);
 		if (!ret)
-			goto out;
+			return FALSE;
 	}
 
 	/* just mark each one as core */
@@ -188,12 +185,11 @@ gs_plugin_refine (GsPlugin *plugin,
 		}
 	}
 	if (apps == NULL) {
-		ret = FALSE;
 		g_set_error (error,
 			     GS_PLUGIN_ERROR,
 			     GS_PLUGIN_ERROR_FAILED,
 			     "No moduleset data found");
-		goto out;
+		return FALSE;
 	}
 
 	/* just mark each one as core */
@@ -210,10 +206,7 @@ gs_plugin_refine (GsPlugin *plugin,
 			}
 		}
 	}
-out:
-	g_strfreev (apps);
-	g_strfreev (pkgs);
-	return ret;
+	return TRUE;
 }
 
 /* vim: set noexpandtab: */

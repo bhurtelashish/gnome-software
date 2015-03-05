@@ -47,6 +47,7 @@
 #include <gtk/gtk.h>
 
 #include "gs-app.h"
+#include "gs-cleanup.h"
 #include "gs-utils.h"
 
 static void	gs_app_finalize	(GObject	*object);
@@ -56,8 +57,7 @@ struct GsAppPrivate
 	gchar			*id;
 	gchar			*name;
 	GsAppQuality		 name_quality;
-	gchar			*icon;
-	gchar			*icon_path;
+	AsIcon			*icon;
 	GPtrArray		*sources;
 	GPtrArray		*source_ids;
 	gchar			*project_group;
@@ -209,14 +209,25 @@ gs_app_to_string (GsApp *app)
 		g_string_append (str, "\tkudo:\tperfect-screenshots\n");
 	if ((priv->kudos & GS_APP_KUDO_HIGH_CONTRAST) > 0)
 		g_string_append (str, "\tkudo:\thigh-contrast\n");
+	if ((priv->kudos & GS_APP_KUDO_APPDATA_DESCRIPTION) > 0)
+		g_string_append (str, "\tkudo:\tappdata-description\n");
 	g_string_append_printf (str, "\tkudo-percentage:\t%i\n",
 				gs_app_get_kudos_percentage (app));
 	if (priv->name != NULL)
 		g_string_append_printf (str, "\tname:\t%s\n", priv->name);
-	if (priv->icon != NULL)
-		g_string_append_printf (str, "\ticon:\t%s\n", priv->icon);
-	if (priv->icon_path != NULL)
-		g_string_append_printf (str, "\ticon-path:\t%s\n", priv->icon_path);
+	if (priv->icon != NULL) {
+		g_string_append_printf (str, "\ticon-kind:\t%s\n",
+					as_icon_kind_to_string (as_icon_get_kind (priv->icon)));
+		if (as_icon_get_name (priv->icon) != NULL)
+			g_string_append_printf (str, "\ticon-name:\t%s\n",
+						as_icon_get_name (priv->icon));
+		if (as_icon_get_prefix (priv->icon) != NULL)
+			g_string_append_printf (str, "\ticon-prefix:\t%s\n",
+						as_icon_get_prefix (priv->icon));
+		if (as_icon_get_filename (priv->icon) != NULL)
+			g_string_append_printf (str, "\ticon-filename:\t%s\n",
+						as_icon_get_filename (priv->icon));
+	}
 	if (priv->version != NULL)
 		g_string_append_printf (str, "\tversion:\t%s\n", priv->version);
 	if (priv->version_ui != NULL)
@@ -312,7 +323,7 @@ notify_idle_cb (gpointer data)
 	AppNotifyData *notify_data = data;
 
 	g_object_notify (G_OBJECT (notify_data->app),
-	                 notify_data->property_name);
+			 notify_data->property_name);
 
 	g_object_unref (notify_data->app);
 	g_free (notify_data->property_name);
@@ -770,19 +781,59 @@ gs_app_set_project_group (GsApp *app, const gchar *project_group)
 }
 
 /**
+ * gs_app_is_addon_id_kind
+ **/
+static gboolean
+gs_app_is_addon_id_kind (GsApp *app)
+{
+	AsIdKind id_kind;
+	id_kind = gs_app_get_id_kind (app);
+	if (id_kind == AS_ID_KIND_DESKTOP)
+		return FALSE;
+	if (id_kind == AS_ID_KIND_WEB_APP)
+		return FALSE;
+	return TRUE;
+}
+
+/**
  * gs_app_get_pixbuf:
  */
 GdkPixbuf *
 gs_app_get_pixbuf (GsApp *app)
 {
 	g_return_val_if_fail (GS_IS_APP (app), NULL);
+
+	if (app->priv->pixbuf == NULL && gs_app_get_state (app) == AS_APP_STATE_AVAILABLE_LOCAL) {
+		const gchar *icon_name;
+
+		if (gs_app_get_kind (app) == GS_APP_KIND_SOURCE)
+			icon_name = "x-package-repository";
+		else if (gs_app_is_addon_id_kind (app))
+			icon_name = "application-x-addon";
+		else
+			icon_name = "application-x-executable";
+		app->priv->pixbuf = gtk_icon_theme_load_icon (gtk_icon_theme_get_default (),
+		                                              icon_name, 96,
+		                                              GTK_ICON_LOOKUP_USE_BUILTIN |
+		                                              GTK_ICON_LOOKUP_FORCE_SIZE,
+		                                              NULL);
+	}
+
+	if (app->priv->pixbuf == NULL && gs_app_get_kind (app) == GS_APP_KIND_MISSING) {
+		app->priv->pixbuf = gtk_icon_theme_load_icon (gtk_icon_theme_get_default (),
+		                                              "dialog-question-symbolic", 16,
+		                                              GTK_ICON_LOOKUP_USE_BUILTIN |
+		                                              GTK_ICON_LOOKUP_FORCE_SIZE,
+		                                              NULL);
+	}
+
 	return app->priv->pixbuf;
 }
 
 /**
  * gs_app_get_icon:
  */
-const gchar *
+AsIcon *
 gs_app_get_icon (GsApp *app)
 {
 	g_return_val_if_fail (GS_IS_APP (app), NULL);
@@ -793,37 +844,48 @@ gs_app_get_icon (GsApp *app)
  * gs_app_set_icon:
  */
 void
-gs_app_set_icon (GsApp *app, const gchar *icon)
+gs_app_set_icon (GsApp *app, AsIcon *icon)
 {
 	g_return_if_fail (GS_IS_APP (app));
-	g_return_if_fail (icon != NULL);
 
 	/* save icon */
-	g_free (app->priv->icon);
-	app->priv->icon = g_strdup (icon);
+	g_clear_object (&app->priv->icon);
+	if (icon != NULL)
+		app->priv->icon = g_object_ref (icon);
+}
+
+static GtkIconTheme *icon_theme_singleton;
+static GMutex	icon_theme_lock;
+static GHashTable   *icon_theme_paths;
+
+/**
+ * icon_theme_get:
+ */
+static GtkIconTheme *
+icon_theme_get (void)
+{
+	if (icon_theme_singleton == NULL)
+		icon_theme_singleton = gtk_icon_theme_new ();
+
+	return icon_theme_singleton;
 }
 
 /**
- * gs_app_get_icon_path:
+ * icon_theme_add_path:
  */
-const gchar *
-gs_app_get_icon_path (GsApp *app)
+static void
+icon_theme_add_path (const gchar *path)
 {
-	g_return_val_if_fail (GS_IS_APP (app), NULL);
-	return app->priv->icon_path;
-}
+	if (path == NULL)
+		return;
 
-/**
- * gs_app_set_icon_path:
- */
-void
-gs_app_set_icon_path (GsApp *app, const gchar *icon_path)
-{
-	g_return_if_fail (GS_IS_APP (app));
+	if (icon_theme_paths == NULL)
+		icon_theme_paths = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
 
-	/* save theme path */
-	g_free (app->priv->icon_path);
-	app->priv->icon_path = g_strdup (icon_path);
+	if (!g_hash_table_contains (icon_theme_paths, path)) {
+		gtk_icon_theme_prepend_search_path (icon_theme_get (), path);
+		g_hash_table_add (icon_theme_paths, g_strdup (path));
+	}
 }
 
 /**
@@ -832,24 +894,52 @@ gs_app_set_icon_path (GsApp *app, const gchar *icon_path)
 gboolean
 gs_app_load_icon (GsApp *app, gint scale, GError **error)
 {
-	GdkPixbuf *pixbuf = NULL;
-	gboolean ret = TRUE;
+	AsIcon *icon;
+	_cleanup_object_unref_ GdkPixbuf *pixbuf = NULL;
 
 	g_return_val_if_fail (GS_IS_APP (app), FALSE);
 	g_return_val_if_fail (app->priv->icon != NULL, FALSE);
 
 	/* either load from the theme or from a file */
-	pixbuf = gs_pixbuf_load (app->priv->icon, app->priv->icon_path,
-				 64 * scale, error);
-	if (pixbuf == NULL) {
-		ret = FALSE;
-		goto out;
+	icon = gs_app_get_icon (app);
+	switch (as_icon_get_kind (icon)) {
+	case AS_ICON_KIND_LOCAL:
+		if (as_icon_get_filename (icon) == NULL) {
+			g_set_error (error,
+				     GS_PLUGIN_ERROR,
+				     GS_PLUGIN_ERROR_FAILED,
+				     "%s icon has no filename",
+				     as_icon_get_name (icon));
+			return FALSE;
+		}
+		pixbuf = gdk_pixbuf_new_from_file_at_size (as_icon_get_filename (icon),
+							   64 * scale,
+							   64 * scale,
+							   error);
+		break;
+	case AS_ICON_KIND_STOCK:
+		g_mutex_lock (&icon_theme_lock);
+		icon_theme_add_path (as_icon_get_prefix (icon));
+		pixbuf = gtk_icon_theme_load_icon (icon_theme_get (),
+						   as_icon_get_name (icon),
+						   64 * scale,
+						   GTK_ICON_LOOKUP_USE_BUILTIN |
+						   GTK_ICON_LOOKUP_FORCE_SIZE,
+						   error);
+		g_mutex_unlock (&icon_theme_lock);
+		break;
+	default:
+		g_set_error (error,
+			     GS_PLUGIN_ERROR,
+			     GS_PLUGIN_ERROR_FAILED,
+			     "%s icon cannot be loaded",
+			     as_icon_kind_to_string (as_icon_get_kind (icon)));
+		break;
 	}
+	if (pixbuf == NULL)
+		return FALSE;
 	gs_app_set_pixbuf (app, pixbuf);
-out:
-	if (pixbuf != NULL)
-		g_object_unref (pixbuf);
-	return ret;
+	return TRUE;
 }
 
 /**
@@ -2019,9 +2109,9 @@ gs_app_init (GsApp *app)
 						     g_free,
 						     g_free);
 	app->priv->addons_hash = g_hash_table_new_full (g_str_hash,
-	                                                g_str_equal,
-	                                                g_free,
-	                                                NULL);
+							g_str_equal,
+							g_free,
+							NULL);
 	app->priv->related_hash = g_hash_table_new_full (g_str_hash,
 							 g_str_equal,
 							 g_free,
@@ -2045,8 +2135,6 @@ gs_app_finalize (GObject *object)
 	g_free (priv->id);
 	g_free (priv->name);
 	g_hash_table_unref (priv->urls);
-	g_free (priv->icon);
-	g_free (priv->icon_path);
 	g_free (priv->licence);
 	g_free (priv->menu_path);
 	g_free (priv->origin);
@@ -2069,6 +2157,8 @@ gs_app_finalize (GObject *object)
 	g_hash_table_unref (priv->related_hash);
 	g_ptr_array_unref (priv->related);
 	g_ptr_array_unref (priv->history);
+	if (priv->icon != NULL)
+		g_object_unref (priv->icon);
 	if (priv->pixbuf != NULL)
 		g_object_unref (priv->pixbuf);
 	if (priv->featured_pixbuf != NULL)

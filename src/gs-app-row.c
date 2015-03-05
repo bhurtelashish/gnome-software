@@ -26,6 +26,7 @@
 #include <gtk/gtk.h>
 
 #include "gs-app-row.h"
+#include "gs-cleanup.h"
 #include "gs-star-widget.h"
 #include "gs-markdown.h"
 #include "gs-utils.h"
@@ -47,6 +48,7 @@ struct _GsAppRowPrivate
 	GtkWidget	*label;
 	GtkWidget	*checkbox;
 	gboolean	 colorful;
+	gboolean	 show_codec;
 	gboolean	 show_update;
 	gboolean	 selectable;
 	guint		 pending_refresh_id;
@@ -75,30 +77,29 @@ static guint signals [SIGNAL_LAST] = { 0 };
 static GString *
 gs_app_row_get_description (GsAppRow *app_row)
 {
-	GString *str = NULL;
 	GsAppRowPrivate *priv = app_row->priv;
-	GsMarkdown *markdown = NULL;
 	const gchar *tmp = NULL;
-	gchar *escaped = NULL;
+	_cleanup_free_ gchar *escaped = NULL;
 
 	/* convert the markdown update description into PangoMarkup */
 	if (priv->show_update &&
 	    gs_app_get_state (priv->app) == AS_APP_STATE_UPDATABLE) {
 		tmp = gs_app_get_update_details (priv->app);
 		if (tmp != NULL && tmp[0] != '\0') {
+			_cleanup_object_unref_ GsMarkdown *markdown = NULL;
 			markdown = gs_markdown_new (GS_MARKDOWN_OUTPUT_PANGO);
 			gs_markdown_set_smart_quoting (markdown, FALSE);
 			gs_markdown_set_autocode (markdown, FALSE);
 			gs_markdown_set_autolinkify (markdown, FALSE);
 			escaped = gs_markdown_parse (markdown, tmp);
-			str = g_string_new (escaped);
-			goto out;
+			return g_string_new (escaped);
 		}
 	}
 
-	/* try all these things in order */
 	if (gs_app_get_kind (priv->app) == GS_APP_KIND_MISSING)
-		tmp = gs_app_get_summary_missing (priv->app);
+		return g_string_new (gs_app_get_summary_missing (priv->app));
+
+	/* try all these things in order */
 	if (tmp == NULL || (tmp != NULL && tmp[0] == '\0'))
 		tmp = gs_app_get_description (priv->app);
 	if (tmp == NULL || (tmp != NULL && tmp[0] == '\0'))
@@ -106,12 +107,7 @@ gs_app_row_get_description (GsAppRow *app_row)
 	if (tmp == NULL || (tmp != NULL && tmp[0] == '\0'))
 		tmp = gs_app_get_name (priv->app);
 	escaped = g_markup_escape_text (tmp, -1);
-	str = g_string_new (escaped);
-out:
-	if (markdown != NULL)
-		g_object_unref (markdown);
-	g_free (escaped);
-	return str;
+	return g_string_new (escaped);
 }
 
 /**
@@ -123,8 +119,6 @@ gs_app_row_refresh (GsAppRow *app_row)
 	GsAppRowPrivate *priv = app_row->priv;
 	GtkStyleContext *context;
 	GString *str = NULL;
-	GsFolders *folders;
-	const gchar *folder;
 
 	if (app_row->priv->app == NULL)
 		return;
@@ -145,7 +139,11 @@ gs_app_row_refresh (GsAppRow *app_row)
 				     gs_app_get_update_version_ui (priv->app));
 	} else {
 		gtk_widget_hide (priv->version_label);
-		gtk_widget_show (priv->star);
+		if (gs_app_get_kind (priv->app) == GS_APP_KIND_MISSING ||
+		    (gs_app_get_state (priv->app) == AS_APP_STATE_AVAILABLE_LOCAL && gs_app_get_rating (priv->app) < 0))
+			gtk_widget_hide (priv->star);
+		else
+			gtk_widget_show (priv->star);
 		gtk_widget_set_sensitive (priv->star, FALSE);
 		if (gs_app_get_rating_kind (priv->app) == GS_APP_RATING_KIND_USER) {
 			gs_star_widget_set_rating (GS_STAR_WIDGET (priv->star),
@@ -160,21 +158,29 @@ gs_app_row_refresh (GsAppRow *app_row)
 				     gs_app_get_version_ui (priv->app));
 	}
 
-	if (priv->show_update) {
+	if (priv->show_update || priv->show_codec) {
 		gtk_widget_hide (priv->folder_label);
 	} else {
+		_cleanup_object_unref_ GsFolders *folders = NULL;
+		const gchar *folder;
 		folders = gs_folders_get ();
 		folder = gs_folders_get_app_folder (folders, gs_app_get_id (priv->app), gs_app_get_categories (priv->app));
 		if (folder)
 			folder = gs_folders_get_folder_name (folders, folder);
 		gtk_label_set_label (GTK_LABEL (priv->folder_label), folder);
 		gtk_widget_set_visible (priv->folder_label, folder != NULL);
-		g_object_unref (folders);
 	}
 
 	if (gs_app_get_pixbuf (priv->app))
 		gs_image_set_from_pixbuf (GTK_IMAGE (priv->image),
 					  gs_app_get_pixbuf (priv->app));
+
+	context = gtk_widget_get_style_context (priv->image);
+	if (gs_app_get_kind (priv->app) == GS_APP_KIND_MISSING)
+		gtk_style_context_add_class (context, "dimmer-label");
+	else
+		gtk_style_context_remove_class (context, "dimmer-label");
+
 	gtk_widget_set_visible (priv->button, FALSE);
 	gtk_widget_set_sensitive (priv->button, TRUE);
 	gtk_widget_set_visible (priv->spinner, FALSE);
@@ -186,9 +192,16 @@ gs_app_row_refresh (GsAppRow *app_row)
 	switch (gs_app_get_state (app_row->priv->app)) {
 	case AS_APP_STATE_UNAVAILABLE:
 		gtk_widget_set_visible (priv->button, TRUE);
-		/* TRANSLATORS: this is a button next to the search results that
-		 * allows the application to be easily installed */
-		gtk_button_set_label (GTK_BUTTON (priv->button), _("Visit website"));
+		if (gs_app_get_url (app_row->priv->app, AS_URL_KIND_MISSING) != NULL) {
+			/* TRANSLATORS: this is a button next to the search results that
+			 * allows the application to be easily installed */
+			gtk_button_set_label (GTK_BUTTON (priv->button), _("Visit website"));
+		} else {
+			/* TRANSLATORS: this is a button next to the search results that
+			 * allows the application to be easily installed.
+			 * The ellipsis indicates that further steps are required */
+			gtk_button_set_label (GTK_BUTTON (priv->button), _("Install…"));
+		}
 		break;
 	case AS_APP_STATE_QUEUED_FOR_INSTALL:
 		gtk_widget_set_visible (priv->label, TRUE);
@@ -209,8 +222,7 @@ gs_app_row_refresh (GsAppRow *app_row)
 		break;
 	case AS_APP_STATE_UPDATABLE:
 	case AS_APP_STATE_INSTALLED:
-		if (gs_app_get_kind (app_row->priv->app) != GS_APP_KIND_SYSTEM &&
-		    !app_row->priv->show_update)
+		if (gs_app_get_kind (app_row->priv->app) != GS_APP_KIND_SYSTEM)
 			gtk_widget_set_visible (priv->button, TRUE);
 		/* TRANSLATORS: this is a button next to the search results that
 		 * allows the application to be easily removed */
@@ -314,8 +326,8 @@ gs_app_row_refresh_idle_cb (gpointer user_data)
  **/
 static void
 gs_app_row_notify_props_changed_cb (GsApp *app,
-                                    GParamSpec *pspec,
-                                    GsAppRow *app_row)
+				    GParamSpec *pspec,
+				    GsAppRow *app_row)
 {
 	GsAppRowPrivate *priv = app_row->priv;
 	if (priv->pending_refresh_id > 0)
@@ -367,13 +379,13 @@ gs_app_row_set_property (GObject *object, guint prop_id, const GValue *value, GP
 {
 	GsAppRow *app_row = GS_APP_ROW (object);
 
-        switch (prop_id) {
-        case PROP_SELECTED:
+	switch (prop_id) {
+	case PROP_SELECTED:
 		gs_app_row_set_selected (app_row, g_value_get_boolean (value));
 		break;
-        default:
-                G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-                break;
+	default:
+		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+		break;
 	}
 }
 
@@ -382,12 +394,12 @@ gs_app_row_get_property (GObject *object, guint prop_id, GValue *value, GParamSp
 {
 	GsAppRow *app_row = GS_APP_ROW (object);
 
-        switch (prop_id) {
-        case PROP_SELECTED:
+	switch (prop_id) {
+	case PROP_SELECTED:
 		g_value_set_boolean (value, gs_app_row_get_selected (app_row));
 		break;
-        default:
-                G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+	default:
+		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
        		break;
 	}
 }
@@ -471,8 +483,8 @@ gs_app_row_init (GsAppRow *app_row)
 
 void
 gs_app_row_set_size_groups (GsAppRow *app_row,
-                            GtkSizeGroup *image,
-                            GtkSizeGroup *name)
+			    GtkSizeGroup *image,
+			    GtkSizeGroup *name)
 {
 	gtk_size_group_add_widget (image, app_row->priv->image);
 	gtk_size_group_add_widget (name, app_row->priv->name_box);
@@ -483,6 +495,12 @@ gs_app_row_set_colorful (GsAppRow *app_row,
 			    gboolean     colorful)
 {
 	app_row->priv->colorful = colorful;
+}
+
+void
+gs_app_row_set_show_codec (GsAppRow *app_row, gboolean show_codec)
+{
+	app_row->priv->show_codec = show_codec;
 }
 
 /**

@@ -39,15 +39,16 @@ void	 gs_app_notify_failed_modal	(GsApp		*app,
 					 GtkWindow	*parent_window,
 					 GsPluginLoaderAction action,
 					 const GError	*error);
+GtkResponseType
+	gs_app_notify_unavailable	(GsApp		*app,
+					 GtkWindow	*parent);
+void	 gs_app_show_url		(GsApp		*app,
+					 AsUrlKind	 kind);
 
 guint	 gs_string_replace		(GString	*string,
 					 const gchar	*search,
 					 const gchar	*replace);
 gboolean gs_mkdir_parent		(const gchar	*path,
-					 GError		**error);
-GdkPixbuf *gs_pixbuf_load		(const gchar	*icon_name,
-					 const gchar	*icon_path,
-					 guint		 icon_size,
 					 GError		**error);
 void     gs_reboot                      (GCallback	  reboot_failed);
 

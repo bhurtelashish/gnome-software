@@ -89,6 +89,7 @@ typedef enum {
 	GS_APP_KUDO_IBUS_HAS_SYMBOL		= 1 << 11,
 	GS_APP_KUDO_PERFECT_SCREENSHOTS		= 1 << 12,
 	GS_APP_KUDO_HIGH_CONTRAST		= 1 << 13,
+	GS_APP_KUDO_APPDATA_DESCRIPTION		= 1 << 14,
 	GS_APP_KUDO_LAST
 } GsAppKudo;
 
@@ -194,12 +195,9 @@ void		 gs_app_set_management_plugin	(GsApp		*app,
 GdkPixbuf	*gs_app_get_pixbuf		(GsApp		*app);
 void		 gs_app_set_pixbuf		(GsApp		*app,
 						 GdkPixbuf	*pixbuf);
-const gchar	*gs_app_get_icon		(GsApp		*app);
+AsIcon		*gs_app_get_icon		(GsApp		*app);
 void		 gs_app_set_icon		(GsApp		*app,
-						 const gchar	*icon);
-const gchar	*gs_app_get_icon_path		(GsApp		*app);
-void		 gs_app_set_icon_path		(GsApp		*app,
-						 const gchar	*icon_path);
+						 AsIcon		*icon);
 gboolean	 gs_app_load_icon		(GsApp		*app,
 						 gint		 scale,
 						 GError		**error);

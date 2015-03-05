@@ -1,9 +1,9 @@
-# Copyright (C) 2010-2012 Richard Hughes <richard@hughsie.com>
+# Copyright (C) 2010-2015 Richard Hughes <richard@hughsie.com>
 AC_PREREQ(2.63)
 
-AC_INIT([gnome-software],[3.14.2],[http://bugzilla.gnome.org/enter_bug.cgi?product=gnome-software])
+AC_INIT([gnome-software],[3.15.92],[http://bugzilla.gnome.org/enter_bug.cgi?product=gnome-software])
 AC_CONFIG_SRCDIR(src)
-AM_INIT_AUTOMAKE([1.11 no-dist-gzip dist-xz tar-ustar serial-tests])
+AM_INIT_AUTOMAKE([1.11 no-dist-gzip dist-xz tar-ustar serial-tests foreign])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -61,11 +61,12 @@ dnl - Check library dependencies
 dnl ---------------------------------------------------------------------------
 PKG_CHECK_MODULES(GTK, gtk+-3.0 >= 3.14.1 gio-unix-2.0)
 PKG_CHECK_MODULES(PACKAGEKIT, packagekit-glib2 >= 1.0.0)
-PKG_CHECK_MODULES(APPSTREAM, appstream-glib >= 0.3.2)
+PKG_CHECK_MODULES(APPSTREAM, appstream-glib >= 0.3.4)
 PKG_CHECK_MODULES(SQLITE, sqlite3)
 PKG_CHECK_MODULES(SOUP, libsoup-2.4)
 PKG_CHECK_MODULES(GSETTINGS_DESKTOP_SCHEMAS, gsettings-desktop-schemas >= 3.11.5)
 PKG_CHECK_MODULES(GNOME_DESKTOP, gnome-desktop-3.0)
+AC_PATH_PROG(APPSTREAM_UTIL, [appstream-util], [unfound])
 AC_ARG_ENABLE(man,
               [AS_HELP_STRING([--enable-man],
                               [generate man pages [default=auto]])],,
